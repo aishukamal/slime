@@ -1452,6 +1452,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
             )
+            parser.add_argument(
+                "--phase-callback-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a PhaseCallback subclass for driver-level phase notifications. "
+                    "The class is instantiated once; on_phase_begin/on_phase_end are called "
+                    "at each GPU phase boundary (init, generate, train, weight_sync, save, eval). "
+                    "Example: 'my_module.MyPhaseCallback'."
+                ),
+            )
             return parser
 
         def add_mtp_training_arguments(parser):
