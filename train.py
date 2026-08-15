@@ -4,13 +4,18 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.phase_callback import load_phase_callback
 
 
 def train(args):
     configure_logger()
     release_train = args.release_train
+    phase_cb = load_phase_callback(args)
 
     # allocate the GPUs
+    if phase_cb:
+        phase_cb.on_phase_begin("init", "both")
+
     pgs = create_placement_groups(args)
     init_tracking(args)
 
@@ -32,9 +37,16 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
 
+    if phase_cb:
+        phase_cb.on_phase_end("init", "both")
+
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
+        if phase_cb:
+            phase_cb.on_phase_begin("eval", "sampler")
         ray.get(rollout_manager.eval.remote(rollout_id=0))
+        if phase_cb:
+            phase_cb.on_phase_end("eval", "sampler")
 
     def offload_train(actor_trains_this_step):
         # Each model auto-offloads after train() when offload_train is set,
@@ -48,16 +60,34 @@ def train(args):
     # train loop.
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+            if phase_cb:
+                phase_cb.on_phase_begin("eval", "sampler", {"rollout_id": rollout_id})
             ray.get(rollout_manager.eval.remote(rollout_id))
+            if phase_cb:
+                phase_cb.on_phase_end("eval", "sampler", {"rollout_id": rollout_id})
 
+        if phase_cb:
+            phase_cb.on_phase_begin("generate", "sampler", {"rollout_id": rollout_id})
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        if phase_cb:
+            phase_cb.on_phase_end("generate", "sampler", {"rollout_id": rollout_id})
 
         if args.offload_rollout:
+            if phase_cb:
+                phase_cb.on_phase_begin("offload", "sampler", {"rollout_id": rollout_id})
             ray.get(rollout_manager.offload.remote())
+            if phase_cb:
+                phase_cb.on_phase_end("offload", "sampler", {"rollout_id": rollout_id})
 
         if release_train:
+            if phase_cb:
+                phase_cb.on_phase_begin("create", "trainer", {"rollout_id": rollout_id})
             actor_model.create()
+            if phase_cb:
+                phase_cb.on_phase_end("create", "trainer", {"rollout_id": rollout_id})
 
+        if phase_cb:
+            phase_cb.on_phase_begin("train", "trainer", {"rollout_id": rollout_id})
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
@@ -80,16 +110,38 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
 
         offload_train(actor_trains)
+        if phase_cb:
+            phase_cb.on_phase_end("train", "trainer", {"rollout_id": rollout_id})
+
         if args.offload_rollout and not release_train:
+            if phase_cb:
+                phase_cb.on_phase_begin("onload", "sampler", {"rollout_id": rollout_id})
             ray.get(rollout_manager.onload_weights.remote())
+            if phase_cb:
+                phase_cb.on_phase_end("onload", "sampler", {"rollout_id": rollout_id})
+
+        if phase_cb:
+            phase_cb.on_phase_begin("weight_sync", "both", {"rollout_id": rollout_id})
         actor_model.update_weights()
+        if phase_cb:
+            phase_cb.on_phase_end("weight_sync", "both", {"rollout_id": rollout_id})
 
         if args.offload_rollout:
+            if phase_cb:
+                phase_cb.on_phase_begin("onload", "sampler", {"rollout_id": rollout_id})
             ray.get(rollout_manager.onload_kv.remote())
+            if phase_cb:
+                phase_cb.on_phase_end("onload", "sampler", {"rollout_id": rollout_id})
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+            if phase_cb:
+                phase_cb.on_phase_begin("eval", "sampler", {"rollout_id": rollout_id})
             ray.get(rollout_manager.eval.remote(rollout_id))
+            if phase_cb:
+                phase_cb.on_phase_end("eval", "sampler", {"rollout_id": rollout_id})
 
+    if phase_cb:
+        phase_cb.close()
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)
 
